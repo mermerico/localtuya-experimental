@@ -31,6 +31,7 @@ from homeassistant.const import (
     PRECISION_WHOLE,
     UnitOfTemperature,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
@@ -182,6 +183,9 @@ DEFAULT_PRECISION = PRECISION_TENTHS
 DEFAULT_TEMPERATURE_STEP = PRECISION_HALVES
 # Empirically tested to work for AVATTO thermostat
 MODE_WAIT = 0.1
+COMMAND_RETRIES = 3
+COMMAND_CONFIRM_INTERVAL = 0.2
+COMMAND_CONFIRM_CHECKS = 10
 
 FAN_SPEEDS_DEFAULT = "auto,low,middle,high"
 
@@ -493,6 +497,44 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         """Return the list of available fan modes."""
         return self._fan_supported_speeds
 
+    def _states_match(self, expected: dict) -> bool:
+        """Return whether the latest device-reported datapoints match a command."""
+        return all(self.dp_value(str(dp)) == value for dp, value in expected.items())
+
+    async def _async_set_dps_verified(self, states: dict, verify: dict | None = None):
+        """Write datapoints and retry until a fresh status read confirms them."""
+        expected = verify or states
+
+        for attempt in range(1, COMMAND_RETRIES + 1):
+            await self._device.set_dps(states)
+
+            for _ in range(COMMAND_CONFIRM_CHECKS // 2):
+                if self._states_match(expected):
+                    return
+                await asyncio.sleep(COMMAND_CONFIRM_INTERVAL)
+
+            try:
+                await self._device.async_refresh_status()
+            except Exception as ex:  # The retry below handles transient read errors.
+                self.debug("Status readback failed after command: %s", ex)
+
+            for _ in range(COMMAND_CONFIRM_CHECKS // 2):
+                if self._states_match(expected):
+                    return
+                await asyncio.sleep(COMMAND_CONFIRM_INTERVAL)
+
+            if attempt < COMMAND_RETRIES:
+                self.warning(
+                    "Command was not confirmed by device state; retrying (%s/%s)",
+                    attempt,
+                    COMMAND_RETRIES,
+                )
+
+        raise HomeAssistantError(
+            f"{self.name} did not confirm the requested state after "
+            f"{COMMAND_RETRIES} attempts"
+        )
+
     @property
     def swing_mode(self) -> str | None:
         """Return the swing setting."""
@@ -535,16 +577,18 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
                 temperature = round(c_to_f(temperature))
 
             temperature = round(temperature / self._precision_target)
-            await self._device.set_dp(
-                temperature, self._config[CONF_TARGET_TEMPERATURE_DP]
+            await self._async_set_dps_verified(
+                {self._config[CONF_TARGET_TEMPERATURE_DP]: temperature}
             )
 
     async def async_set_fan_mode(self, fan_mode):
         """Set new target fan mode."""
+        new_states = {}
         if not self._is_on:
-            await self._device.set_dp(self._state_on, self._dp_id)
+            new_states[self._dp_id] = self._state_on
 
-        await self._device.set_dp(fan_mode, self._fan_speed_dp)
+        new_states[self._fan_speed_dp] = fan_mode
+        await self._async_set_dps_verified(new_states)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode):
         """Set new target operation mode."""
@@ -554,18 +598,34 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
         if hvac_mode in self._hvac_mode_set.names:
             new_states[self._hvac_mode_dp] = self._hvac_mode_set.to_tuya(hvac_mode)
+
+            # Some air conditioners reset their setpoint when a mode is written by
+            # itself. Include the existing target temperature in the same Tuya
+            # command so changing (or reasserting) a mode preserves the setpoint.
+            if (
+                self.has_config(CONF_TARGET_TEMPERATURE_DP)
+                and self._target_temperature is not None
+                and hvac_mode
+                in (HVACMode.AUTO, HVACMode.COOL, HVACMode.HEAT, HVACMode.HEAT_COOL)
+            ):
+                temperature = self._target_temperature
+                if self._target_temp_forced_to_celsius:
+                    temperature = round(c_to_f(temperature))
+                new_states[self._config[CONF_TARGET_TEMPERATURE_DP]] = round(
+                    temperature / self._precision_target
+                )
         elif hvac_mode == HVACMode.OFF:
             new_states[self._dp_id] = self._state_off
 
-        await self._device.set_dps(new_states)
+        await self._async_set_dps_verified(new_states)
 
     async def async_turn_on(self) -> None:
         """Turn the entity on."""
-        await self._device.set_dp(self._state_on, self._dp_id)
+        await self._async_set_dps_verified({self._dp_id: self._state_on})
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
-        await self._device.set_dp(self._state_off, self._dp_id)
+        await self._async_set_dps_verified({self._dp_id: self._state_off})
 
     async def async_set_preset_mode(self, preset_mode):
         """Set new target preset mode."""
@@ -592,22 +652,37 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         """Device status was updated."""
         self._state = self.dp_value(self._dp_id)
 
+        incoming_mode = self.dp_value(CONF_HVAC_MODE_DP)
+        effective_mode = (
+            self._hvac_mode_set.to_ha(incoming_mode)
+            if incoming_mode is not None
+            else self._hvac_mode
+        )
+
         # Update target temperature
-        if self.has_config(CONF_TARGET_TEMPERATURE_DP) and (
-            target_dp_value := self.dp_value(CONF_TARGET_TEMPERATURE_DP)
+        target_temperature_updated = False
+        if (
+            self.has_config(CONF_TARGET_TEMPERATURE_DP)
+            and (target_dp_value := self.dp_value(CONF_TARGET_TEMPERATURE_DP))
+            and effective_mode not in (HVACMode.DRY, HVACMode.FAN_ONLY)
         ):
             self._target_temperature = target_dp_value * self._precision_target
+            target_temperature_updated = True
 
         # Update current temperature
+        current_temperature_updated = False
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP) and (
             current_dp_temp := self.dp_value(CONF_CURRENT_TEMPERATURE_DP)
         ):
             self._current_temperature = current_dp_temp * self._precision
+            current_temperature_updated = True
 
         # Force the Current temperature and Target temperature to matching the unit.
-        if self._target_temp_forced_to_celsius:
+        if self._target_temp_forced_to_celsius and target_temperature_updated:
             self._target_temperature = f_to_c(self._target_temperature)
-        elif self._target_temp_forced_to_celsius is False:
+        elif (
+            self._target_temp_forced_to_celsius is False and current_temperature_updated
+        ):
             self._current_temperature = f_to_c(self._current_temperature)
 
         # Update preset states

@@ -432,6 +432,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             except TimeoutError:
                 pass
 
+    async def async_refresh_status(self) -> dict:
+        """Request and dispatch a fresh device status for command verification."""
+        await self.check_connection()
+        if not self._interface:
+            return {}
+
+        status = await self._interface.status(cid=self._node_id)
+        if status:
+            self.status_updated(status)
+        return status or {}
+
     async def _async_reconnect(self):
         """Task: continuously attempt to reconnect to the device."""
         attempts = 0
