@@ -2,6 +2,7 @@
 
 import asyncio
 import homeassistant.util.ulid as ulid_util
+import inspect
 import os, sys
 import pytest
 import threading
@@ -36,7 +37,10 @@ async def init(config: dict[str, dict[str, Any]], entity_domain, entity_class):
         "", (), {"_thread_id": threading.get_ident()}
     )
     hass = HomeAssistant("")
-    entry = ConfigEntry(**create_entry(config))
+    entry_data = create_entry(config)
+    if "subentries_data" in inspect.signature(ConfigEntry).parameters:
+        entry_data["subentries_data"] = {}
+    entry = ConfigEntry(**entry_data)
     tuya_api = TuyaCloudApi("EU", "test_client_id", "test_secret", "test_user_id")
 
     hass.data.setdefault("localtuya", {entry.entry_id: {}})

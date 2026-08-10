@@ -1,12 +1,16 @@
 """Test for localtuya."""
 
+from unittest.mock import call
+
 from . import *
+import custom_components.localtuya.climate as climate_module
 from custom_components.localtuya.climate import (
     LocalTuyaClimate,
     HVACAction,
     HVACMode,
     DOMAIN as PLATFORM_DOMAIN,
 )
+from homeassistant.exceptions import HomeAssistantError
 
 FAN_SPEED_LIST = ["auto", "low", "middle", "high"]
 CONFIG = {
@@ -28,6 +32,8 @@ CONFIG = {
                     "auto": "program",
                     "heat": "manual",
                     "cool": "COLD",
+                    "dry": "dehumidify",
+                    "fan_only": "fan",
                 },
                 "hvac_action_dp": "100",
                 "hvac_action_set": {
@@ -135,3 +141,80 @@ async def test_climate():
     device.status_updated({**DPS_STATUS, **{"11": "up", "12": "both"}})
     assert entity_1.swing_mode == "up-only"
     assert entity_1.swing_horizontal_mode == "left-and-right"
+
+
+async def test_climate_retries_until_command_is_confirmed(monkeypatch):
+    """Climate commands are retried until device status confirms the change."""
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaClimate)
+    entity, *_ = get_entites(device)
+    device.status_updated(DPS_STATUS)
+
+    monkeypatch.setattr(climate_module, "COMMAND_CONFIRM_INTERVAL", 0)
+    monkeypatch.setattr(climate_module, "COMMAND_CONFIRM_CHECKS", 2)
+
+    attempts = 0
+
+    async def set_dps(states):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            device.status_updated({**DPS_STATUS, **states})
+
+    device.set_dps = AsyncMock(side_effect=set_dps)
+    device.async_refresh_status = AsyncMock(return_value={})
+
+    await entity.async_set_hvac_mode(HVACMode.HEAT)
+
+    expected = {"2": "manual", "16": 68}
+    assert device.set_dps.await_args_list == [call(expected), call(expected)]
+    device.async_refresh_status.assert_awaited_once_with()
+
+
+async def test_climate_raises_when_command_is_not_confirmed(monkeypatch):
+    """An unconfirmed command reports failure after all retry attempts."""
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaClimate)
+    entity, *_ = get_entites(device)
+    device.status_updated(DPS_STATUS)
+
+    monkeypatch.setattr(climate_module, "COMMAND_RETRIES", 2)
+    monkeypatch.setattr(climate_module, "COMMAND_CONFIRM_INTERVAL", 0)
+    monkeypatch.setattr(climate_module, "COMMAND_CONFIRM_CHECKS", 2)
+
+    device.set_dps = AsyncMock()
+    device.async_refresh_status = AsyncMock(return_value={})
+
+    with pytest.raises(HomeAssistantError, match="did not confirm"):
+        await entity._async_set_dps_verified({"2": "manual"})
+
+    assert device.set_dps.await_count == 2
+    assert device.async_refresh_status.await_count == 2
+
+
+async def test_climate_ignores_non_setpoint_temperature_by_mode():
+    """Dry and fan modes do not overwrite the last real target temperature."""
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaClimate)
+    entity, *_ = get_entites(device)
+    device.status_updated(DPS_STATUS)
+    target_temperature = entity.target_temperature
+
+    device.status_updated({**DPS_STATUS, "2": "fan", "16": 99})
+    assert entity.target_temperature == target_temperature
+
+    device.status_updated({**DPS_STATUS, "2": "COLD", "16": 70})
+    assert entity.target_temperature != target_temperature
+
+
+async def test_refresh_status_dispatches_readback():
+    """A requested device readback is dispatched to all entities."""
+    device = await init(CONFIG, PLATFORM_DOMAIN, LocalTuyaClimate)
+    status = {"2": "manual"}
+    device.check_connection = AsyncMock()
+    device._interface = Mock()
+    device._interface.status = AsyncMock(return_value=status)
+    device.status_updated = Mock()
+
+    result = await device.async_refresh_status()
+
+    assert result == status
+    device._interface.status.assert_awaited_once_with(cid=device._node_id)
+    device.status_updated.assert_called_once_with(status)
