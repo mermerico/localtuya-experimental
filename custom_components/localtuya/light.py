@@ -7,7 +7,6 @@ import homeassistant.util.color as color_util
 import voluptuous as vol
 
 from dataclasses import dataclass
-from functools import partial
 from homeassistant.helpers import selector
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -23,7 +22,8 @@ from homeassistant.components.light import (
 from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP, CONF_SCENE
 
 from .config_flow import col_to_select
-from .entity import LocalTuyaEntity, async_setup_entry
+from .entity import LocalTuyaEntity, async_setup_entry as async_setup_individuals
+from .light_groups import async_setup_groups
 from .const import (
     CONF_BRIGHTNESS_LOWER,
     CONF_BRIGHTNESS_UPPER,
@@ -666,4 +666,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 self._state = self._last_state
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    """Set up individual lights and explicitly configured native groups."""
+    await async_setup_individuals(
+        DOMAIN, LocalTuyaLight, flow_schema, hass, config_entry, async_add_entities
+    )
+    await async_setup_groups(hass, config_entry, async_add_entities)
