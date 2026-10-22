@@ -417,6 +417,13 @@ class TuyaListener(ABC):
     def status_updated(self, status):
         """Device updated status."""
 
+    def status_query_updated(self, status):
+        """Handle a potentially cached query response."""
+        self.status_updated(status)
+
+    def group_status_updated(self, group_id, status):
+        """Handle a native mesh group report separately from a child report."""
+
     @abstractmethod
     def disconnected(self, exc=""):
         """Device disconnected."""
@@ -575,6 +582,13 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             if "dps" not in decoded_message:
                 return
 
+            data = decoded_message.get("data", decoded_message)
+            listener = self.listener and self.listener()
+            if data.get("ctype") == 2 and data.get("mbid"):
+                if listener is not None:
+                    listener.group_status_updated(data["mbid"], data.get("dps", {}))
+                return
+
             if dps_payload := decoded_message.get("dps"):
                 if cid := decoded_message.get("cid"):
                     self.dps_cache.setdefault(cid, {})
@@ -595,7 +609,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 else:
                     status = self.dps_cache.get("parent", {})
 
-                listener.status_updated(status)
+                # Send only changed DPs: cached power must not masquerade as a
+                # fresh individual update after a native group command.
+                if data.get("type") == "query":
+                    listener.status_query_updated(decoded_message["dps"])
+                else:
+                    listener.status_updated(decoded_message["dps"])
 
         return MessageDispatcher(self.id, _status_update, self.version, self.local_key)
 
@@ -753,14 +772,20 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         dps: dict = None,
         nodeID: str = None,
         payload: dict = None,
+        strict: bool = False,
     ):
         """Send and receive a message, returning response from device."""
         if not self.is_connected:
+            if strict:
+                raise ConnectionError("Device is disconnected")
             return None
 
         if self.version >= 3.4 and self.real_local_key == self.local_key:
             self.debug("3.4 or 3.5 device: negotiating a new session key")
             if not await self._negotiate_session_key():
+                if strict:
+                    self.clean_up_session()
+                    raise ConnectionError("Session negotiation failed")
                 return self.clean_up_session()
 
         self.debug(
@@ -785,11 +810,19 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         try:
             await self.transport_write(enc_payload)
         except Exception:  # pylint: disable=broad-except
+            if strict:
+                self.clean_up_session()
+                raise
             return self.clean_up_session()
         msg = await self.dispatcher.wait_for(seqno, payload.cmd)
         if msg is None:
             self.debug("Wait was aborted for seqno %d", seqno)
+            if strict:
+                raise ConnectionError("Command response was interrupted")
             return None
+
+        if strict and msg.retcode != 0:
+            raise RuntimeError(f"Gateway rejected command: {msg.retcode}")
 
         # TODO: Verify stuff, e.g. CRC sequence number?
         if (
@@ -801,6 +834,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             self.debug(f"ACK received for command {real_cmd}: ignoring: {msg.seqno}")
             return None
         payload = self._decode_payload(msg.payload)
+        if strict and "Error" in payload:
+            raise RuntimeError("Gateway returned an error")
 
         # Perform a new exchange (once) if we switched device type
         if dev_type != self.dev_type:
@@ -879,6 +914,25 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
     async def set_dps(self, dps, cid=None):
         """Set values for a set of datapoints."""
         return await self.exchange(CMDType.CONTROL, dps, nodeID=cid)
+
+    async def set_group_dps(self, dps, cid, group_id):
+        """Send a native group command through the existing gateway session."""
+        if self.version != 3.4:
+            raise ValueError("Native mesh groups currently require protocol 3.4")
+        if not cid or not isinstance(group_id, str) or not group_id or not dps:
+            raise ValueError("A child ID, string group ID and datapoints are required")
+        payload = MessagePayload(
+            CMDType.CONTROL_NEW,
+            json.dumps(
+                {
+                    "protocol": 5,
+                    "t": int(time.time()),
+                    "data": {"cid": cid, "ctype": 2, "mbid": group_id, "dps": dps},
+                },
+                separators=(",", ":"),
+            ).encode(),
+        )
+        return await self.exchange(CMDType.CONTROL_NEW, payload=payload, strict=True)
 
     async def subdevices_query(self):
         """Request a list of sub-devices and their status."""

@@ -83,6 +83,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self.local_key = self._device_config.local_key
 
         self._status = {}
+        self._group_overrides = {}
         self._interface: TuyaProtocol = None
 
         # For SubDevices
@@ -263,7 +264,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 if status is None:
                     raise Exception("Failed to retrieve status")
 
-                self.status_updated(status)
+                self.status_query_updated(status)
             except (UnicodeDecodeError, DecodeError) as e:
                 self.exception(f"Handshake with {host} failed: due to {type(e)}: {e}")
                 await self.abort_connect()
@@ -440,7 +441,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         status = await self._interface.status(cid=self._node_id)
         if status:
-            self.status_updated(status)
+            self.status_query_updated(status)
         return status or {}
 
     async def _async_reconnect(self):
@@ -620,10 +621,38 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # Fake gateways are only used to pass commands no need to update status.
             return
 
+        for dp in status:
+            self._group_overrides.pop(dp, None)
+
         self._last_update_time = time.monotonic()
         self._handle_event(self._status, status)
         self._status.update(status)
         self._dispatch_status()
+
+    @callback
+    def status_query_updated(self, status):
+        """Keep group-derived values when the gateway returns stale child data."""
+        overrides = self._group_overrides.copy()
+        self.status_updated({**status, **overrides})
+        self._group_overrides.update(overrides)
+
+    @callback
+    def apply_group_status(self, status):
+        """Reflect a group command in a known member without sending unicast."""
+        self.status_updated(status)
+        self._group_overrides.update(status)
+
+    @callback
+    def group_status_updated(self, group_id, status):
+        """Route group reports without polluting the representative child's DPs."""
+        dispatcher_send(self.hass, f"localtuya_group_{self.id}_{group_id}", status)
+
+    async def set_group_dps(self, group_id, dps):
+        """Use this child's existing shared gateway connection for group writes."""
+        await self.check_connection()
+        if not self.connected:
+            raise ConnectionError("Light gateway is unavailable")
+        await self._interface.set_group_dps(dps, self._node_id, group_id)
 
     @callback
     def disconnected(self, exc=""):

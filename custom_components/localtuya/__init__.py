@@ -45,6 +45,12 @@ from .const import (
 )
 
 from .discovery import TuyaDiscovery
+from .light_groups import CONF_LIGHT_GROUPS, GROUPS_SCHEMA
+
+CONFIG_SCHEMA = vol.Schema(
+    {DOMAIN: vol.Schema({vol.Optional(CONF_LIGHT_GROUPS, default=[]): GROUPS_SCHEMA})},
+    extra=vol.ALLOW_EXTRA,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +70,9 @@ SERVICE_SET_DP_SCHEMA = vol.Schema(
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the LocalTuya integration component."""
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][CONF_LIGHT_GROUPS] = config.get(DOMAIN, {}).get(
+        CONF_LIGHT_GROUPS, []
+    )
 
     current_entries = hass.config_entries.async_entries(DOMAIN)
     device_cache = {}
