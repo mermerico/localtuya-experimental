@@ -180,3 +180,19 @@ def test_restored_values_filter_unrelated_and_invalid_datapoints():
     assert "125" not in devices[0]._status
     entity._apply_values({"119": 1, "3": True, "4": 1001})
     assert not entity.is_on and entity.color_temp_kelvin == 6500
+
+
+async def test_individual_write_supersedes_group_value_without_a_device_report():
+    entity, _, devices = group()
+    entity._apply_values({"119": False, "3": 300})
+    device = devices[0]
+    device._interface = SimpleNamespace(set_dps=AsyncMock())
+    device.check_connection = AsyncMock()
+    device._node_id = "child"
+    device._device_config = SimpleNamespace(manual_dps="")
+    device._pending_status = {"1": True, "3": 700}
+    await device.set_status()
+    device._interface.set_dps.assert_awaited_once_with({"1": True, "3": 700}, cid="child", strict=True)
+    assert entity.is_on
+    assert device._status["3"] == 700
+    assert not device._group_overrides

@@ -84,6 +84,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         self._status = {}
         self._group_overrides = {}
+        self._native_group_member = False
         self._interface: TuyaProtocol = None
 
         # For SubDevices
@@ -394,10 +395,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._interface and self._pending_status:
             payload, self._pending_status = self._pending_status.copy(), {}
             try:
-                await self._interface.set_dps(payload, cid=self._node_id)
+                if self._native_group_member:
+                    await self._interface.set_dps(
+                        payload, cid=self._node_id, strict=True
+                    )
+                else:
+                    await self._interface.set_dps(payload, cid=self._node_id)
                 # bluetooth devices usually does not send updated status payload.
                 # NOTE: This will override the status if the BLE device fails to receive the signal.
-                if self.is_write_only:
+                if self.is_write_only or self._native_group_member:
                     self.status_updated(payload)
             except (TimeoutError, Exception) as ex:
                 self.debug(f"Failed to set values {payload} --> {ex}", force=True)

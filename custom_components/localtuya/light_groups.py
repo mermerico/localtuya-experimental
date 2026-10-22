@@ -152,6 +152,8 @@ class NativeLightGroup(RestoreEntity, LightEntity):
         self.config = config
         self.representative = representative
         self.members = members
+        for member, _ in members:
+            member._native_group_member = True
         self._attr_unique_id = f"native_group_{config['unique_id']}"
         self._attr_name = config["name"]
         self._attr_min_color_temp_kelvin = config["min_kelvin"]

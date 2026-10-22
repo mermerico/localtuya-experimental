@@ -911,9 +911,9 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         """
         return await self.exchange(CMDType.CONTROL, {str(dp_index): value}, nodeID=cid)
 
-    async def set_dps(self, dps, cid=None):
+    async def set_dps(self, dps, cid=None, strict=False):
         """Set values for a set of datapoints."""
-        return await self.exchange(CMDType.CONTROL, dps, nodeID=cid)
+        return await self.exchange(CMDType.CONTROL, dps, nodeID=cid, strict=strict)
 
     async def set_group_dps(self, dps, cid, group_id):
         """Send a native group command through the existing gateway session."""
