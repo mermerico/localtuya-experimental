@@ -11,7 +11,9 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.localtuya.coordinator import TuyaDevice
 from custom_components.localtuya.core.pytuya import TuyaProtocol, EmptyListener
 from custom_components.localtuya.core.pytuya.const import CMDType, TuyaMessage
-from custom_components.localtuya.light_groups import GROUPS_SCHEMA, NativeLightGroup
+from custom_components.localtuya.light_groups import (
+    GROUPS_SCHEMA, NativeLightGroup, decode_color, encode_color,
+)
 
 
 def config(**changes):
@@ -196,3 +198,75 @@ async def test_individual_write_supersedes_group_value_without_a_device_report()
     assert entity.is_on
     assert device._status["3"] == 700
     assert not device._group_overrides
+
+
+def rgb_group():
+    entity, rep, devices = group()
+    cfg = config(color_dp="11", color_mode_dp="2", color_switch_dp="108", white_switch_dp="107")
+    entity = NativeLightGroup(cfg, rep, entity.members)
+    entity.async_write_ha_state = Mock()
+    entity._apply_values({"3": 500, "4": 500})
+    return entity, rep, devices
+
+
+@pytest.mark.parametrize("value", [None, "garbage", "AA==", "AAAAAAA=", "/////w==", "AAClMg==", 100])
+def test_reject_malformed_rgb_reports(value):
+    assert decode_color(value) is None
+
+
+@pytest.mark.parametrize("hue", [0, 120, 240, 300, 360])
+def test_rgb_encoding_uses_two_byte_hue(hue):
+    assert decode_color(encode_color((hue, 100), 128)) == (hue, 100, 50)
+
+
+def test_incomplete_rgb_configuration_rejected():
+    with pytest.raises(vol.Invalid):
+        config(color_dp="11")
+    with pytest.raises(vol.Invalid):
+        config(color_dp="11", color_mode_dp="2", color_switch_dp="119", white_switch_dp="107")
+
+
+async def test_rgb_switch_and_color_use_separate_group_commands():
+    entity, rep, _ = rgb_group()
+    await entity.async_turn_on(hs_color=(300, 100))
+    commands = [call.args[1] for call in rep.set_group_dps.call_args_list]
+    assert commands == [{"108": True}, {"2": "colour"}, {"11": "ASxkMg=="}]
+    assert entity.color_mode == "hs"
+    assert entity.hs_color == (300, 100)
+    assert entity.brightness == 128
+    assert entity.color_temp_kelvin is None
+
+
+async def test_rgb_brightness_changes_raw_value_without_white_command():
+    entity, rep, _ = rgb_group()
+    entity._apply_values({"108": True, "2": "colour", "11": "AHhkMg=="})
+    await entity.async_turn_on(brightness=255)
+    rep.set_group_dps.assert_awaited_once_with("0002", {"11": "AHhkZA=="})
+    assert entity.hs_color == (120, 100) and entity.brightness == 255
+
+
+async def test_return_to_white_preserves_brightness_and_disables_color():
+    entity, rep, _ = rgb_group()
+    entity._apply_values({"108": True, "107": True, "2": "colour", "11": "APBkMg=="})
+    await entity.async_turn_on(color_temp_kelvin=4600)
+    commands = [call.args[1] for call in rep.set_group_dps.call_args_list]
+    assert commands == [{"108": False}, {"2": "white"}, {"107": True}, {"3": 502}, {"4": 500}]
+    assert entity.color_mode == "color_temp"
+    assert entity.brightness == 128 and entity.color_temp_kelvin == 4600
+
+
+async def test_rgb_power_cycle_keeps_color_mode():
+    entity, rep, _ = rgb_group()
+    entity._apply_values({"108": True, "2": "colour", "11": "AABkMg=="})
+    await entity.async_turn_off()
+    await entity.async_turn_on()
+    assert [call.args[1] for call in rep.set_group_dps.call_args_list] == [{"119": False}, {"119": True}]
+    assert entity.color_mode == "hs" and entity.hs_color == (0, 100)
+
+
+def test_rgb_restore_retains_mode_color_and_brightness():
+    entity, _, _ = rgb_group()
+    entity._apply_values({"108": True, "2": "colour", "11": "ASxkMg==", "119": True})
+    entity._apply_values({"11": "not valid", "108": 1})
+    assert entity.color_mode == "hs" and entity.hs_color == (300, 100)
+    assert entity.brightness == 128

@@ -1,6 +1,8 @@
 """Native mesh groups configured explicitly from known app group identifiers."""
 
 import asyncio
+import base64
+import binascii
 import logging
 from statistics import mean
 
@@ -8,6 +10,7 @@ import voluptuous as vol
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
 )
@@ -22,6 +25,32 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 CONF_LIGHT_GROUPS = "light_groups"
 DP = vol.All(vol.Coerce(str), vol.Match(r"^[1-9][0-9]*$"))
+RGB_DPS = ("color_dp", "color_mode_dp", "color_switch_dp", "white_switch_dp")
+GROUP_DPS = ("power_dp", "brightness_dp", "temperature_dp", *RGB_DPS)
+
+
+def decode_color(value):
+    """Decode the verified POWERASIA base64 HH/S/V byte layout."""
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if len(raw) != 4:
+        return None
+    hue, saturation, brightness = int.from_bytes(raw[:2], "big"), raw[2], raw[3]
+    if hue > 360 or saturation > 100 or brightness > 100:
+        return None
+    return hue, saturation, brightness
+
+
+def encode_color(hs, brightness):
+    """Encode degrees, saturation percent and HA brightness for the mesh."""
+    hue = max(0, min(360, round(hs[0])))
+    saturation = max(0, min(100, round(hs[1])))
+    value = max(1, min(100, round(brightness * 100 / 255)))
+    return base64.b64encode(bytes([hue >> 8, hue & 255, saturation, value])).decode()
 
 
 def validate_group(config):
@@ -32,15 +61,15 @@ def validate_group(config):
         raise vol.Invalid("Duplicate group member")
     if config["min_kelvin"] >= config["max_kelvin"]:
         raise vol.Invalid("min_kelvin must be less than max_kelvin")
-    dps = [
-        config[k]
-        for k in ("power_dp", "brightness_dp", "temperature_dp")
-        if k in config
-    ]
+    dps = [config[k] for k in GROUP_DPS if k in config]
     if len(dps) != len(set(dps)):
         raise vol.Invalid("Group datapoints must be distinct")
     if "temperature_dp" in config and "brightness_dp" not in config:
         raise vol.Invalid("Temperature control requires brightness control")
+    if any(k in config for k in RGB_DPS) and not all(k in config for k in RGB_DPS):
+        raise vol.Invalid(
+            "RGB requires color, mode, color-switch and white-switch datapoints"
+        )
     return config
 
 
@@ -57,6 +86,10 @@ GROUP_SCHEMA = vol.All(
             vol.Required("power_dp"): DP,
             vol.Optional("brightness_dp"): DP,
             vol.Optional("temperature_dp"): DP,
+            vol.Optional("color_dp"): DP,
+            vol.Optional("color_mode_dp"): DP,
+            vol.Optional("color_switch_dp"): DP,
+            vol.Optional("white_switch_dp"): DP,
             vol.Optional("min_kelvin", default=2700): cv.positive_int,
             vol.Optional("max_kelvin", default=6500): cv.positive_int,
         }
@@ -164,6 +197,12 @@ class NativeLightGroup(RestoreEntity, LightEntity):
         if "temperature_dp" in config:
             mode = ColorMode.COLOR_TEMP
         self._attr_supported_color_modes = {mode}
+        if "color_dp" in config:
+            self._attr_supported_color_modes.add(ColorMode.HS)
+            self._attr_supported_color_modes.discard(ColorMode.ONOFF)
+            self._attr_supported_color_modes.discard(ColorMode.BRIGHTNESS)
+            if mode in (ColorMode.ONOFF, ColorMode.BRIGHTNESS):
+                mode = ColorMode.HS
         self._attr_color_mode = mode
         self._values = {}
         self._command_lock = asyncio.Lock()
@@ -189,11 +228,16 @@ class NativeLightGroup(RestoreEntity, LightEntity):
 
     @property
     def brightness(self):
+        if self.color_mode == ColorMode.HS:
+            color = decode_color(self._values.get(self.config.get("color_dp")))
+            return round(color[2] * 255 / 100) if color else None
         value = self._mean_value("brightness_dp")
         return round(value * 255 / 1000) if value is not None else None
 
     @property
     def color_temp_kelvin(self):
+        if self.color_mode == ColorMode.HS:
+            return None
         value = self._mean_value("temperature_dp")
         if value is None:
             return None
@@ -201,6 +245,11 @@ class NativeLightGroup(RestoreEntity, LightEntity):
             self.min_color_temp_kelvin
             + value / 1000 * (self.max_color_temp_kelvin - self.min_color_temp_kelvin)
         )
+
+    @property
+    def hs_color(self):
+        color = decode_color(self._values.get(self.config.get("color_dp")))
+        return color[:2] if color else None
 
     @property
     def extra_state_attributes(self):
@@ -237,27 +286,54 @@ class NativeLightGroup(RestoreEntity, LightEntity):
         self.async_write_ha_state()
 
     def _apply_values(self, values):
-        allowed = {
-            self.config[k]
-            for k in ("power_dp", "brightness_dp", "temperature_dp")
-            if k in self.config
-        }
+        allowed = {self.config[k] for k in GROUP_DPS if k in self.config}
         values = {
             dp: value
             for dp, value in values.items()
             if dp in allowed
             and (
-                (dp == self.config["power_dp"] and type(value) is bool)
+                (
+                    dp
+                    in {
+                        self.config.get(k)
+                        for k in ("power_dp", "color_switch_dp", "white_switch_dp")
+                    }
+                    and type(value) is bool
+                )
                 or (
-                    dp != self.config["power_dp"]
+                    dp
+                    in {self.config.get(k) for k in ("brightness_dp", "temperature_dp")}
                     and type(value) is int
                     and 0 <= value <= 1000
+                )
+                or (
+                    dp == self.config.get("color_mode_dp")
+                    and value in ("white", "colour")
+                )
+                or (
+                    dp == self.config.get("color_dp")
+                    and decode_color(value) is not None
                 )
             )
         }
         self._values.update(values)
+        if "color_dp" in self.config:
+            mode = values.get(self.config["color_mode_dp"])
+            color_switch = values.get(self.config["color_switch_dp"])
+            if mode == "colour" or (mode is None and color_switch is True):
+                self._attr_color_mode = ColorMode.HS
+            elif mode == "white" or (mode is None and color_switch is False):
+                self._attr_color_mode = (
+                    ColorMode.COLOR_TEMP
+                    if "temperature_dp" in self.config
+                    else ColorMode.HS
+                )
         for member, mapping in self.members:
-            translated = {mapping[dp]: value for dp, value in values.items()}
+            # RGB is native-group state; existing white-only member entities do
+            # not suddenly gain unsupported individual RGB controls.
+            translated = {
+                mapping[dp]: value for dp, value in values.items() if dp in mapping
+            }
             if translated:
                 member.apply_group_status(translated)
 
@@ -281,6 +357,52 @@ class NativeLightGroup(RestoreEntity, LightEntity):
         if kwargs.get(ATTR_BRIGHTNESS) == 0:
             return await self.async_turn_off()
         async with self._command_lock:
+            rgb = "color_dp" in self.config
+            previous_brightness = self.brightness
+            use_color = rgb and (
+                ATTR_HS_COLOR in kwargs
+                or (
+                    self.color_mode == ColorMode.HS
+                    and ATTR_COLOR_TEMP_KELVIN not in kwargs
+                )
+            )
+            if use_color:
+                switching_to_color = self.color_mode != ColorMode.HS
+                if (
+                    switching_to_color
+                    or self._values.get(self.config["color_switch_dp"]) is not True
+                ):
+                    await self._send(self.config["color_switch_dp"], True)
+                if (
+                    switching_to_color
+                    or self._values.get(self.config["color_mode_dp"]) != "colour"
+                ):
+                    await self._send(self.config["color_mode_dp"], "colour")
+                if ATTR_HS_COLOR in kwargs or ATTR_BRIGHTNESS in kwargs:
+                    hs = kwargs.get(ATTR_HS_COLOR, self.hs_color or (0, 100))
+                    brightness = kwargs.get(ATTR_BRIGHTNESS, previous_brightness or 255)
+                    await self._send(
+                        self.config["color_dp"], encode_color(hs, brightness)
+                    )
+                if not self.is_on or not kwargs:
+                    await self._send(self.config["power_dp"], True)
+                return
+            if rgb and ATTR_COLOR_TEMP_KELVIN in kwargs:
+                switching_to_white = self.color_mode == ColorMode.HS
+                if self.color_mode == ColorMode.HS and ATTR_BRIGHTNESS not in kwargs:
+                    kwargs = {**kwargs, ATTR_BRIGHTNESS: previous_brightness or 255}
+                for key, value in (
+                    ("color_switch_dp", False),
+                    ("color_mode_dp", "white"),
+                    ("white_switch_dp", True),
+                ):
+                    # Channel switches may be mutually exclusive in firmware;
+                    # reassert white on a mode change even if its cache says on.
+                    if (
+                        switching_to_white
+                        or self._values.get(self.config[key]) != value
+                    ):
+                        await self._send(self.config[key], value)
             # Separate property frames are required by POWERASIA BLE lights.
             # Pre-stage brightness to avoid flashing at the previous level.
             if ATTR_BRIGHTNESS in kwargs and "brightness_dp" in self.config:

@@ -3,8 +3,8 @@
 An ordinary Home Assistant light group sends a command to every bulb. A native
 Tuya mesh group sends one gateway command per property, allowing its members to
 change together. This implementation was tested with a GW018-DM gateway using
-protocol 3.4 and six POWERASIA lights. Power, white brightness and color temperature
-were visually verified. RGB, effects and transitions are not implemented.
+protocol 3.4 and six POWERASIA lights. Power, white brightness, color temperature
+and RGB were visually verified. Effects and transitions are not implemented.
 
 Create the group in the Tuya app first. This integration does not create groups or
 change mesh membership. Obtain its exact local group ID from an authenticated LAN
@@ -27,6 +27,10 @@ localtuya:
       power_dp: "119"
       brightness_dp: "3"
       temperature_dp: "4"
+      color_dp: "11"
+      color_mode_dp: "2"
+      color_switch_dp: "108"
+      white_switch_dp: "107"
       min_kelvin: 2700
       max_kelvin: 6500
 ```
@@ -38,6 +42,17 @@ temperature are optional; currently their group ranges are fixed at 10–1000 an
 0–1000 respectively. Member brightness must use an upper bound of 1000, and its
 temperature range/direction must match the group. Overlapping native groups are
 rejected to prevent competing inferred member states.
+
+The four RGB fields are optional as a set. Omit all four for a white-only group.
+They select the verified POWERASIA protocol: DP 11 is base64 encoding of four bytes,
+two for hue in degrees (big endian), one for saturation percent and one for
+brightness percent. RGB brightness therefore has 1% resolution. Color mode uses
+`colour`/`white`; the color channel must be enabled for RGB and disabled when
+returning to white, with the white channel enabled. Each property is sent separately.
+The native entity exposes a color picker, retains its hue when dimmed, and returns
+to white for color-temperature requests, including those from Adaptive Lighting.
+Existing individual bulb entities keep their configured capabilities; enabling RGB
+here does not add individual RGB controls to them.
 
 The entity uses the existing gateway connection and encryption. Each changed
 property gets a separate CONTROL_NEW command:
